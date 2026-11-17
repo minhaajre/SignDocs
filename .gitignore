@@ -27,3 +27,5 @@ playwright-report/
 # Claude Code
 .claude/
 
+.vercel
+.env*
