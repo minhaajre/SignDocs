@@ -254,7 +254,7 @@ test("a reminder is refused once the deadline has passed", async () => {
       userId,
       envelopeId,
       { senderEmail: "sam@example.test", senderName: "Sam Sender" },
-      { database },
+      { database, emailService: recordingEmailService().service },
     ),
     (error: unknown) => {
       assert.ok(error instanceof ReminderMutationError);
@@ -792,6 +792,170 @@ test("a change of deadline and a decline do not lock each other out", async () =
       }
     }
 
+    await rm(envelope.storageDir, { force: true, recursive: true });
+  }
+});
+
+test("a reminder with no email provider is refused before the signer's link is replaced (issue #53)", async () => {
+  const { envelopeId, signerId, userId } = await createSentEnvelope({
+    expiresAt: unixNow() + DAY,
+  });
+  const before = await database.query<{ signing_token_hash: string }>(
+    `select signing_token_hash from signers where id = $1`,
+    [signerId],
+  );
+  const driverBefore = process.env.EMAIL_DRIVER;
+  const keyBefore = process.env.RESEND_API_KEY;
+
+  delete process.env.EMAIL_DRIVER;
+  delete process.env.RESEND_API_KEY;
+
+  try {
+    await assert.rejects(
+      sendManualEnvelopeNudge(
+        userId,
+        envelopeId,
+        { senderEmail: "sam@example.test", senderName: "Sam Sender" },
+        { database },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof ReminderMutationError);
+        assert.equal(error.statusCode, 503);
+        assert.match(error.message, /Email is not set up yet/);
+        return true;
+      },
+    );
+  } finally {
+    for (const [name, value] of [
+      ["EMAIL_DRIVER", driverBefore],
+      ["RESEND_API_KEY", keyBefore],
+    ] as const) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+
+  const after = await database.query<{ signing_token_hash: string }>(
+    `select signing_token_hash from signers where id = $1`,
+    [signerId],
+  );
+
+  assert.equal(
+    after.rows[0]?.signing_token_hash,
+    before.rows[0]?.signing_token_hash,
+  );
+  assert.deepEqual(await auditEvents(envelopeId), []);
+});
+
+/** Runs `run` with no email provider set, as an install whose email setup was removed. */
+async function withoutEmailProvider<T>(
+  run: () => Promise<T>,
+  extra: Record<string, string> = {},
+) {
+  const names = ["EMAIL_DRIVER", "RESEND_API_KEY", ...Object.keys(extra)];
+  const settingsBefore = names.map(
+    (name) => [name, process.env[name]] as const,
+  );
+
+  delete process.env.EMAIL_DRIVER;
+  delete process.env.RESEND_API_KEY;
+  Object.assign(process.env, extra);
+
+  try {
+    return await run();
+  } finally {
+    for (const [name, value] of settingsBefore) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+}
+
+test("the last signer completes the envelope when no email provider is set (issue #96)", async () => {
+  const envelope = await createSignableEnvelope();
+
+  try {
+    await withoutEmailProvider(() =>
+      submitSigningForToken(
+        envelope.token,
+        {
+          clientTimezoneOffsetMinutes: 0,
+          fields: [
+            {
+              fieldId: envelope.fieldId,
+              imageDataUrl: DRAWN_SIGNATURE,
+              inputMethod: "drawn",
+              type: "signature",
+            },
+          ],
+        },
+        { database, storageService: envelope.storageService },
+      ),
+    );
+
+    const state = await database.query<{
+      signed_pdf_key: string | null;
+      signer_status: string;
+      status: string;
+      values: string;
+    }>(
+      `
+        select e.status, e.signed_pdf_key, s.status as signer_status,
+          (select count(*) from fields f
+            where f.id = $2 and f.submitted_at is not null)::text as values
+        from envelopes e join signers s on s.envelope_id = e.id
+        where e.id = $1
+      `,
+      [envelope.envelopeId, envelope.fieldId],
+    );
+
+    assert.equal(state.rows[0]?.status, "completed");
+    assert.equal(state.rows[0]?.signer_status, "signed");
+    assert.ok(state.rows[0]?.signed_pdf_key);
+    assert.equal(state.rows[0]?.values, "1");
+
+    const events = await auditEvents(envelope.envelopeId);
+
+    assert.equal(events.filter((event) => event === "signed").length, 1);
+    assert.equal(events.filter((event) => event === "completed").length, 1);
+    assert.equal(
+      (await verifyAuditChain(envelope.envelopeId, database)).ok,
+      true,
+    );
+  } finally {
+    await rm(envelope.storageDir, { force: true, recursive: true });
+  }
+});
+
+test("a signer can decline when no email provider is set (issue #96)", async () => {
+  const envelope = await createSignableEnvelope();
+
+  try {
+    const declined = await withoutEmailProvider(
+      () =>
+        declineSigningForToken(
+          envelope.token,
+          { reason: "Not what we agreed." },
+          { database },
+        ),
+      { STORAGE_DRIVER: "local", STORAGE_LOCAL_DIR: envelope.storageDir },
+    );
+
+    assert.equal(declined.state, "declined");
+
+    const envelopeRow = await database.query<{ status: string }>(
+      `select status from envelopes where id = $1`,
+      [envelope.envelopeId],
+    );
+
+    assert.equal(envelopeRow.rows[0]?.status, "declined");
+  } finally {
     await rm(envelope.storageDir, { force: true, recursive: true });
   }
 });

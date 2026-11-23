@@ -2,7 +2,10 @@ import { cookies, headers } from "next/headers";
 
 import { SigningShell } from "@/components/signing/signing-shell";
 import { getDb } from "@/lib/db/connection";
-import { getClientIpAddress } from "@/lib/security/request";
+import {
+  getClientIpAddress,
+  getRequestUserAgent,
+} from "@/lib/security/request";
 import type { SigningVerificationState } from "@/lib/schemas/signing";
 import { verifiedMethodsFromCookies } from "@/lib/signer-checks";
 import {
@@ -29,7 +32,13 @@ export default async function SignPage({
   const signatureProblem =
     SIGNATURE_PROBLEMS.find((problem) => problem === problemParam) ?? null;
   let initialState:
-    "already-signed" | "declined" | "error" | "expired" | "voided" | undefined;
+    | "already-signed"
+    | "completed"
+    | "declined"
+    | "error"
+    | "expired"
+    | "voided"
+    | undefined;
   let record: Awaited<ReturnType<typeof getSigningPayloadForToken>> | null =
     null;
   let verification: SigningVerificationState | null = null;
@@ -42,7 +51,7 @@ export default async function SignPage({
       database: getDb(),
       requestMeta: {
         ipAddress: getClientIpAddress(requestHeaders),
-        userAgent: requestHeaders.get("user-agent")?.trim() ?? null,
+        userAgent: getRequestUserAgent(requestHeaders),
       },
       verifiedMethods: verifiedMethodsFromCookies(
         token,

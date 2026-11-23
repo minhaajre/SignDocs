@@ -12,6 +12,11 @@ import {
 } from "@/components/auth/sso-button";
 import { FieldShell, ShellButton } from "@/components/shared/form-shell";
 import { authClient } from "@/lib/auth/client";
+import {
+  describePasswordRefusal,
+  newPasswordLengthError,
+  PASSWORD_TOO_LONG_MESSAGE,
+} from "@/lib/password-messages";
 import { forgotPasswordSchema, loginSchema } from "@/lib/schemas/auth";
 import {
   Dialog,
@@ -258,6 +263,12 @@ function LiveLoginShell({
       } else if (normalizedErrorMessage.includes("email not verified")) {
         setBannerMessage(verificationRequiredMessage);
         setShowResendVerification(true);
+      } else if (
+        describePasswordRefusal(result.error) === PASSWORD_TOO_LONG_MESSAGE
+      ) {
+        // No account has a password this long, so it cannot be right. Say
+        // why instead of "Something went wrong" (issue #57).
+        setErrors({ password: PASSWORD_TOO_LONG_MESSAGE });
       } else {
         setBannerMessage(
           normalizedErrorMessage.includes("invalid email or password")
@@ -632,8 +643,10 @@ function ResetPasswordCard({ resetToken }: { resetToken: string }) {
       formData.get("reset-password") ?? password,
     ).trim();
 
-    if (trimmedPassword.length < 15) {
-      setError("Password must be at least 15 characters");
+    const lengthError = newPasswordLengthError(trimmedPassword);
+
+    if (lengthError) {
+      setError(lengthError);
       setSuccessMessage(null);
       return;
     }
@@ -654,11 +667,8 @@ function ResetPasswordCard({ resetToken }: { resetToken: string }) {
       setError(
         normalizedErrorMessage.includes("invalid token")
           ? "This reset link is invalid or has expired."
-          : normalizedErrorMessage.includes("password too short")
-            ? "Password must be at least 15 characters"
-            : normalizedErrorMessage.includes("compromised")
-              ? "Choose a password that hasn't appeared in a breach"
-              : "Something went wrong. Please try again.",
+          : (describePasswordRefusal(result.error) ??
+              "Something went wrong. Please try again."),
       );
       setIsSubmitting(false);
       return;

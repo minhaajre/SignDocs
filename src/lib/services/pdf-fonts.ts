@@ -20,31 +20,19 @@ import type { Color, PDFDocument, PDFFont, PDFPage } from "pdf-lib";
 // Not handled: right-to-left scripts (Arabic, Hebrew) and scripts that need
 // glyph shaping (Thai, the Indic scripts). Those draw as "\uFFFD".
 
-// Each path is spelled out so that Next.js file tracing copies the file into
-// the deployed function.
-const FONT_PATHS = {
-  bold: path.join(process.cwd(), "src", "assets", "fonts", "NotoSans-Bold.ttf"),
-  cjk: path.join(
-    process.cwd(),
-    "src",
-    "assets",
-    "fonts",
-    "NotoSansCJKjp-Regular.ttf",
-  ),
-  regular: path.join(
-    process.cwd(),
-    "src",
-    "assets",
-    "fonts",
-    "NotoSans-Regular.ttf",
-  ),
-  signature: path.join(
-    process.cwd(),
-    "src",
-    "assets",
-    "fonts",
-    "GreatVibes-Regular.ttf",
-  ),
+const FONT_DIRECTORY = path.join(process.cwd(), "src", "assets", "fonts");
+
+// Each file is read by its own call, with its name written out, so the
+// build can work out the path and copy just that file into a deployed
+// function. A path looked up at run time makes it copy the entire project
+// instead.
+const FONT_READERS = {
+  bold: () => fs.readFile(path.join(FONT_DIRECTORY, "NotoSans-Bold.ttf")),
+  cjk: () =>
+    fs.readFile(path.join(FONT_DIRECTORY, "NotoSansCJKjp-Regular.ttf")),
+  regular: () => fs.readFile(path.join(FONT_DIRECTORY, "NotoSans-Regular.ttf")),
+  signature: () =>
+    fs.readFile(path.join(FONT_DIRECTORY, "GreatVibes-Regular.ttf")),
 } as const;
 
 const SUBSETTER_PATH = path.join(
@@ -55,7 +43,7 @@ const SUBSETTER_PATH = path.join(
   "harfbuzz-subset.wasm",
 );
 
-type FontName = keyof typeof FONT_PATHS;
+type FontName = keyof typeof FONT_READERS;
 
 type LoadedFont = {
   bytes: Uint8Array;
@@ -68,7 +56,7 @@ function loadFont(name: FontName): Promise<LoadedFont> {
   let loaded = loadedFonts.get(name);
 
   if (!loaded) {
-    loaded = fs.readFile(FONT_PATHS[name]).then((buffer) => {
+    loaded = FONT_READERS[name]().then((buffer) => {
       const bytes = new Uint8Array(buffer);
 
       return {
@@ -269,6 +257,85 @@ export function toDrawableText(value: string): string {
 
 /** Drawn in place of a character that none of the fonts has. */
 const REPLACEMENT_CHARACTER = 0xfffd;
+
+type LaidOutGlyph = {
+  advanceWidth: number;
+  codePoints: number[];
+  id: number;
+};
+
+/** The parts of pdf-lib 1.17's CustomFontEmbedder this file reaches into. */
+type CustomFontEmbedderInternals = {
+  encodeText(text: string): unknown;
+  font: {
+    layout(
+      text: string,
+      features?: unknown,
+    ): { glyphs: readonly LaidOutGlyph[] };
+  };
+  fontFeatures?: unknown;
+  glyphCache: { access(): LaidOutGlyph[] };
+};
+
+/**
+ * Makes the font's width table and ToUnicode map cover every glyph drawn
+ * with it, not only the one glyph per character pdf-lib lists.
+ *
+ * pdf-lib draws the glyphs fontkit's layout picks, ligatures and
+ * contextual alternates included, but it builds the font's /W widths and
+ * ToUnicode map from one glyph per character in the font's character set.
+ * A substituted glyph (Great Vibes draws "Pr", "or", "en" and "th" as one
+ * glyph each) was then missing from both: readers fell back to a width of
+ * 1000, which left a gap inside the name (issue #59), and had no text for
+ * it, so copying or searching the signature lost letters (issue #58).
+ * Every glyph laid out here is added to the list both are built from, with
+ * the characters fontkit says it stands for. The list is read when the
+ * document is saved, after everything has been drawn.
+ */
+export function includeLaidOutGlyphs(font: PDFFont): PDFFont {
+  const embedder = (
+    font as unknown as { embedder?: CustomFontEmbedderInternals }
+  ).embedder;
+
+  if (
+    !embedder ||
+    typeof embedder.encodeText !== "function" ||
+    typeof embedder.font?.layout !== "function" ||
+    typeof embedder.glyphCache?.access !== "function"
+  ) {
+    return font;
+  }
+
+  const laidOut = new Map<number, LaidOutGlyph>();
+  const encodeText = embedder.encodeText.bind(embedder);
+  const listed = embedder.glyphCache;
+
+  embedder.encodeText = (text: string) => {
+    for (const glyph of embedder.font.layout(text, embedder.fontFeatures)
+      .glyphs) {
+      if (glyph.codePoints.length > 0) {
+        laidOut.set(glyph.id, glyph);
+      }
+    }
+
+    return encodeText(text);
+  };
+  embedder.glyphCache = {
+    access() {
+      const glyphs = new Map(listed.access().map((glyph) => [glyph.id, glyph]));
+
+      for (const [id, glyph] of laidOut) {
+        if (!glyphs.has(id)) {
+          glyphs.set(id, glyph);
+        }
+      }
+
+      return [...glyphs.values()].sort((a, b) => a.id - b.id);
+    },
+  };
+
+  return font;
+}
 
 type FaceFont = {
   characters: ReadonlySet<number>;
@@ -475,14 +542,16 @@ export async function embedTextFaces(
     if (whole || !subset) {
       return {
         characters: loaded.characters,
-        font: await pdfDocument.embedFont(loaded.bytes),
+        font: includeLaidOutGlyphs(await pdfDocument.embedFont(loaded.bytes)),
       };
     }
 
     try {
       return {
         characters: new Set(wanted),
-        font: await pdfDocument.embedFont(subset(loaded.bytes, wanted)),
+        font: includeLaidOutGlyphs(
+          await pdfDocument.embedFont(subset(loaded.bytes, wanted)),
+        ),
       };
     } catch (error) {
       console.error("A font could not be subset for a PDF:", error);

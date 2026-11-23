@@ -19,6 +19,12 @@ import { normalizedRectToPdfRect } from "../utils/pdf-coords.ts";
 import { shouldStampField, stampFieldValue } from "./pdf-finalize.ts";
 import { embedTextFaces } from "./pdf-fonts.ts";
 import {
+  displayedRectToUserSpaceBox,
+  fieldOnDisplayedPage,
+  getDisplayedPageGeometry,
+  type StoredPageSize,
+} from "./pdf-page-geometry.ts";
+import {
   appendIncrementalUpdate,
   prepareSignedUpdate,
   readTrailer,
@@ -323,10 +329,13 @@ export async function prepareSignerRevision(
   {
     fields,
     images,
+    pages,
     signature,
   }: {
     fields: readonly FieldRecord[];
     images: ReadonlyMap<string, Uint8Array>;
+    /** The envelope's stored page sizes, which fields were placed against. */
+    pages: readonly StoredPageSize[];
     signature: RevisionSignature;
   },
 ): Promise<{ bytes: Uint8Array; digest: Buffer }> {
@@ -355,21 +364,28 @@ export async function prepareSignerRevision(
         },
       );
       const imageCache = new Map<string, PDFImage>();
+      const storedPages = new Map(pages.map((page) => [page.pageNumber, page]));
       let signaturePlaced = false;
 
-      for (const field of fields.filter(shouldStampField)) {
-        const page = document.getPage(field.page - 1);
-        const size = { heightPt: page.getHeight(), widthPt: page.getWidth() };
-        const rect = normalizedRectToPdfRect(field, size);
+      for (const placedField of fields.filter(shouldStampField)) {
+        const page = document.getPage(placedField.page - 1);
+        const geometry = getDisplayedPageGeometry(page);
+        const field = fieldOnDisplayedPage(
+          placedField,
+          storedPages.get(placedField.page),
+          geometry,
+        );
+        // Where the field is in the page's own coordinates, which is what
+        // the annotation's rectangle is given in.
+        const box = displayedRectToUserSpaceBox(
+          normalizedRectToPdfRect(field, geometry),
+          geometry,
+        );
         // Drawn on a page of its own, then taken as a form XObject cut to
-        // the field, so the original page's content is never touched.
-        const scratch = document.addPage([size.widthPt, size.heightPt]);
-        const box = {
-          bottom: rect.yPt,
-          left: rect.xPt,
-          right: rect.xPt + rect.widthPt,
-          top: rect.yPt + rect.heightPt,
-        };
+        // the field, so the original page's content is never touched. It
+        // is drawn with the original page's geometry, so the value is in
+        // the same place and turned the same way as it would be there.
+        const scratch = document.addPage([geometry.widthPt, geometry.heightPt]);
 
         await stampFieldValue(
           field,
@@ -378,6 +394,7 @@ export async function prepareSignerRevision(
           imageCache,
           document,
           imageStore,
+          geometry,
         );
 
         const embedded = await document.embedPage(scratch, box);

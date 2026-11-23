@@ -2,8 +2,11 @@ import { NextResponse } from "next/server";
 
 import { AuditExportError, exportEnvelopeAuditCsv } from "@/lib/audit-export";
 import { requireVerifiedSenderSession } from "@/lib/auth/route-session";
+import { resolveEnvelopeViewerAccess } from "@/lib/envelope-access";
 import { logRouteError } from "@/lib/security/logging";
 import { getClientIpAddress, getRequestPathname } from "@/lib/security/request";
+import { buildContentDisposition } from "@/lib/services/storage";
+import { recordSystemAuditEvent } from "@/lib/services/system-audit";
 
 type EnvelopeAuditRouteContext = {
   params: Promise<{
@@ -11,7 +14,8 @@ type EnvelopeAuditRouteContext = {
   }>;
 };
 
-// The envelope's audit trail as a CSV file, for its sender.
+// The envelope's audit trail as a CSV file, for its sender, or for an
+// administrator, who sees every envelope.
 export async function GET(
   request: Request,
   context: EnvelopeAuditRouteContext,
@@ -25,12 +29,39 @@ export async function GET(
   const { id } = await context.params;
 
   try {
-    const file = await exportEnvelopeAuditCsv(sessionResult.user.id, id);
+    // Its sender's, or, once sent, a teammate's or any administrator's.
+    const access = await resolveEnvelopeViewerAccess(sessionResult.user.id, id);
+    const file = await exportEnvelopeAuditCsv(
+      access?.ownerUserId ?? sessionResult.user.id,
+      id,
+    );
+
+    if (access && !access.viewerIsOwner) {
+      // An administrator or a teammate taking a copy of someone else's
+      // records is on record in the install's audit trail. No record, no
+      // file.
+      await recordSystemAuditEvent({
+        actorEmail: sessionResult.user.email,
+        actorUserId: sessionResult.user.id,
+        event: "envelope_file_downloaded",
+        ipAddress: getClientIpAddress(request.headers),
+        metadata: {
+          envelopeId: id,
+          file: "audit_trail",
+          ownerEmail: access.ownerEmail,
+          ownerUserId: access.ownerUserId,
+        },
+        targetUserId: access.ownerUserId,
+        userAgent: request.headers.get("user-agent"),
+      });
+    }
 
     return new Response(file.body, {
       headers: {
         "cache-control": "private, no-store",
-        "content-disposition": `attachment; filename="${file.fileName}"`,
+        // The name comes from the envelope's title, which may hold
+        // characters a header cannot carry as they are.
+        "content-disposition": buildContentDisposition(file.fileName),
         "content-type": "text/csv; charset=utf-8",
         "x-content-type-options": "nosniff",
       },

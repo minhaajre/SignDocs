@@ -1,23 +1,26 @@
 "use client";
 
-import { FileTextIcon } from "lucide-react";
-
-import { Brand } from "@/components/layout/brand";
-import { PublicLegalFooter } from "@/components/layout/public-legal-links";
 import type {
   SigningPayload,
   SigningVerificationState,
 } from "@/lib/schemas/signing";
+import { EmbedParentMessage } from "./embed-parent-message";
 import { SignerVerificationScreen } from "./signer-verification-screen";
+import { SigningStateScreen } from "./signing-state-screen";
 import {
   SigningLiveShell,
   type ProviderSignatureProblem,
 } from "./signing-live-shell";
 
 type SigningUnavailableState =
-  "already-signed" | "declined" | "error" | "expired" | "voided";
+  "already-signed" | "completed" | "declined" | "error" | "expired" | "voided";
 
 type SigningShellProps = {
+  /**
+   * Set on an embedded signing page: the site framing it, which is told
+   * when the signer signs or declines, or why the page cannot be used.
+   */
+  embedOrigin?: string | null;
   initialState?: SigningUnavailableState;
   record?: SigningPayload;
   /** Set when the signer came back from a signing provider without signing. */
@@ -40,8 +43,14 @@ const tokenStateCopy: Record<
     description: "Request a new signing link from the sender.",
   },
   "already-signed": {
-    title: "You've already signed",
-    description: "You already completed your signature for this document.",
+    title: "You've already finished",
+    description:
+      "You already signed or approved this document. No further action is needed.",
+  },
+  completed: {
+    title: "This envelope has been completed",
+    description:
+      "Everyone has signed this document. No further action is needed.",
   },
   voided: {
     title: "This envelope has been voided",
@@ -51,11 +60,12 @@ const tokenStateCopy: Record<
   declined: {
     title: "This envelope has been declined",
     description:
-      "A signer declined this document. No further action is needed.",
+      "A signer declined, or an approver rejected, this document. No further action is needed.",
   },
 };
 
 export function SigningShell({
+  embedOrigin = null,
   initialState,
   record,
   signatureProblem,
@@ -64,7 +74,11 @@ export function SigningShell({
 }: SigningShellProps) {
   if (record) {
     return (
-      <SigningLiveShell record={record} signatureProblem={signatureProblem} />
+      <SigningLiveShell
+        embedOrigin={embedOrigin}
+        record={record}
+        signatureProblem={signatureProblem}
+      />
     );
   }
 
@@ -72,50 +86,25 @@ export function SigningShell({
     return <SignerVerificationScreen state={verification} token={token} />;
   }
 
-  const tokenState = tokenStateCopy[initialState ?? "error"];
+  const state = initialState ?? "error";
+  const tokenState = tokenStateCopy[state];
 
   return (
-    <StandaloneStateScreen
-      description={tokenState.description}
-      title={tokenState.title}
-    />
-  );
-}
-
-function StandaloneStateScreen({
-  description,
-  title,
-}: {
-  description: string;
-  title: string;
-}) {
-  return (
-    <div className="flex min-h-screen flex-col">
-      <header>
-        <div className="page-width flex items-center py-4">
-          <Brand href="/" />
-        </div>
-      </header>
-      <main className="page-width flex flex-1 items-center justify-center py-10">
-        <section
-          className="panel w-full max-w-[640px] px-6 py-12 text-center sm:px-12 sm:py-14"
-          data-animate="enter"
-        >
-          <span
-            aria-hidden="true"
-            className="mx-auto inline-flex size-14 items-center justify-center rounded-2xl bg-(--accent-soft) text-(--accent)"
-          >
-            <FileTextIcon className="size-6" strokeWidth={2.2} />
-          </span>
-          <h1 className="mt-6 text-[clamp(1.625rem,4vw,2.125rem)] font-extrabold leading-tight tracking-[-0.03em] text-(--fg)">
-            {title}
-          </h1>
-          <p className="mx-auto mt-3 max-w-[460px] text-base leading-7 text-(--secondary)">
-            {description}
-          </p>
-        </section>
-      </main>
-      <PublicLegalFooter />
-    </div>
+    <>
+      {embedOrigin ? (
+        <EmbedParentMessage
+          message={{ state, type: "signudoc:error" }}
+          origin={embedOrigin}
+        />
+      ) : null}
+      <SigningStateScreen
+        description={
+          embedOrigin && state === "expired"
+            ? "Ask the app you are using for a new signing link."
+            : tokenState.description
+        }
+        title={tokenState.title}
+      />
+    </>
   );
 }

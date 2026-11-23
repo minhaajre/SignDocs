@@ -63,6 +63,8 @@ export type RetentionSweepSummary = {
   finishedEnvelopeDeletionFailures: string[];
   finishedEnvelopesDeleted: number;
   finishedEnvelopeWarningsSent: number;
+  /** Files of deleted envelopes that an earlier deletion could not remove. */
+  pendingFileDeletionsDone: number;
   /** Trips to a signing provider ended because nobody came back. */
   providerSigningSessionsEnded: number;
   ranAt: number;
@@ -630,9 +632,21 @@ async function deleteAccountRows(
     [userId],
   );
 
+  // The account's API keys go with its row below. revokeApiKey locks a key
+  // row and then the audit chain, so the key rows are taken here, before
+  // the audit event: in the other order a revoke at the same moment and
+  // this delete would each hold what the other waits for.
+  await database.query(
+    `SELECT id FROM api_keys WHERE user_id = $1 FOR UPDATE`,
+    [userId],
+  );
+
   await recordSystemAuditEvent(
     {
       actorEmail: null,
+      // The daily job deletes it, not a person. The account's own
+      // account_closure_requested event names who asked.
+      actorType: "system",
       actorUserId: null,
       event: "account_deleted",
       metadata: {
@@ -732,6 +746,59 @@ type FinishedEnvelopeRow = EnvelopeArtifactRow & {
 };
 
 /**
+ * Deletes a finished envelope's row for the retention period, unless it
+ * has moved on or an administrator's scheduled deletion now stands, and
+ * queues its files for deletion once this commits. Locks the envelope row
+ * as scheduling a deletion does.
+ */
+async function deleteFinishedEnvelopeRow(
+  envelope: FinishedEnvelopeRow,
+  keys: readonly string[],
+  now: number,
+  scheduledDeletionsExist: boolean,
+  tx: DbExecutor,
+): Promise<boolean> {
+  const locked = await tx.query(
+    `SELECT 1 FROM envelopes WHERE id = $1 AND status = $2 FOR UPDATE`,
+    [envelope.id, envelope.status],
+  );
+
+  if (locked.rowCount !== 1) {
+    return false;
+  }
+
+  if (scheduledDeletionsExist) {
+    const scheduled = await tx.query(
+      `
+        SELECT 1
+        FROM scheduled_envelope_deletions
+        WHERE envelope_id = $1 AND cancelled_at IS NULL
+      `,
+      [envelope.id],
+    );
+
+    if (scheduled.rowCount === 1) {
+      return false;
+    }
+  }
+
+  await queueFileDeletions(envelope.id, keys, now, tx);
+  await tx.query(`DELETE FROM envelopes WHERE id = $1`, [envelope.id]);
+
+  return true;
+}
+
+async function hasScheduledDeletionsTable(
+  database: DbExecutor,
+): Promise<boolean> {
+  const result = await database.query<{ present: boolean }>(
+    `SELECT to_regclass('scheduled_envelope_deletions') IS NOT NULL AS present`,
+  );
+
+  return result.rows[0]?.present === true;
+}
+
+/**
  * Finished envelopes there is something to do with now: not yet warned and
  * inside the warning window, or warned long enough ago and past the period.
  * Envelopes waiting out their notice are left out, so they cannot fill the
@@ -740,11 +807,27 @@ type FinishedEnvelopeRow = EnvelopeArtifactRow & {
 async function listFinishedEnvelopesToHandle(
   {
     deleteBefore,
+    scheduledDeletionsExist,
     warnBefore,
     warnedBefore,
-  }: { deleteBefore: number; warnBefore: number; warnedBefore: number },
+  }: {
+    deleteBefore: number;
+    scheduledDeletionsExist: boolean;
+    warnBefore: number;
+    warnedBefore: number;
+  },
   database: DbExecutor,
 ): Promise<FinishedEnvelopeRow[]> {
+  // An administrator's scheduled deletion has its own notice and wait,
+  // which this timer must not cut short.
+  const scheduledDeletionClause = scheduledDeletionsExist
+    ? `AND NOT EXISTS (
+          SELECT 1
+          FROM scheduled_envelope_deletions s
+          WHERE s.envelope_id = e.id AND s.cancelled_at IS NULL
+        )`
+    : "";
+
   return queryMany<FinishedEnvelopeRow>(
     database,
     `
@@ -767,6 +850,7 @@ async function listFinishedEnvelopesToHandle(
         -- Part 11 records are kept for as long as the rules that apply to
         -- them say, never by this timer.
         AND NOT e.part11
+        ${scheduledDeletionClause}
         AND (
           (
             e.retention_warned_at IS NULL
@@ -836,9 +920,13 @@ async function applyRetentionPeriod(
 ) {
   const warnBefore =
     now - (retentionDays - RETENTION_WARNING_DAYS) * DAY_IN_SECONDS;
+  // A database the scheduled-deletion migration has not reached yet has
+  // no such deletions, and its retention keeps working.
+  const scheduledDeletionsExist = await hasScheduledDeletionsTable(database);
   const candidates = await listFinishedEnvelopesToHandle(
     {
       deleteBefore: now - retentionDays * DAY_IN_SECONDS,
+      scheduledDeletionsExist,
       warnBefore,
       warnedBefore: now - RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS,
     },
@@ -873,22 +961,43 @@ async function applyRetentionPeriod(
         continue;
       }
 
-      // Files first: a failure leaves the row, so the next run retries.
-      await deleteStorageKeys(
-        buildEnvelopeStorageKeys(
+      const keys = buildEnvelopeStorageKeys(
+        envelope,
+        fieldImagesByEnvelopeId.get(envelope.id) ?? [],
+      );
+      // The row goes first, in one transaction with the files' place on
+      // the queue, then the files. An administrator scheduling the
+      // envelope's deletion holds the same lock, so one of the two sees
+      // the other: a request made since the list was read keeps it.
+      const removeRow = (tx: DbExecutor) =>
+        deleteFinishedEnvelopeRow(
           envelope,
-          fieldImagesByEnvelopeId.get(envelope.id) ?? [],
-        ),
-        storageService,
-      );
+          keys,
+          now,
+          scheduledDeletionsExist,
+          tx,
+        );
+      const deleted = isPool(database)
+        ? await withTransaction(removeRow, database)
+        : await removeRow(database);
 
-      const deleted = await database.query(
-        `DELETE FROM envelopes WHERE id = $1 AND status = $2`,
-        [envelope.id, envelope.status],
-      );
-
-      if (deleted.rowCount === 1) {
+      if (deleted) {
         summary.finishedEnvelopesDeleted += 1;
+
+        // A file that cannot be deleted stays queued for the next sweep,
+        // and this run is reported as failed for it.
+        let filesLeft = false;
+
+        for (const key of keys) {
+          if (!(await deletePendingFile(key, database, storageService))) {
+            filesLeft = true;
+          }
+        }
+
+        if (filesLeft) {
+          summary.finishedEnvelopeDeletionFailures.push(envelope.id);
+        }
+
         await deleteThumbnailStoredMeanwhile(envelope, storageService);
       }
     } catch (error) {
@@ -901,17 +1010,11 @@ async function applyRetentionPeriod(
   }
 }
 
-/** Deletes these envelopes and their stored files. Returns how many went. */
-export async function deleteEnvelopesAndFiles(
+async function listEnvelopeArtifacts(
   envelopeIds: readonly string[],
-  database: DbExecutor = getDb(),
-  storageService: StorageService = createStorageService(),
-): Promise<number> {
-  if (envelopeIds.length === 0) {
-    return 0;
-  }
-
-  const envelopes = await queryMany<EnvelopeArtifactRow>(
+  database: DbExecutor,
+): Promise<EnvelopeArtifactRow[]> {
+  return queryMany<EnvelopeArtifactRow>(
     database,
     `
       SELECT
@@ -927,6 +1030,141 @@ export async function deleteEnvelopesAndFiles(
     `,
     [envelopeIds],
   );
+}
+
+/**
+ * Every stored file of an envelope: its PDFs, certificates, first-page
+ * picture, drawn signatures and signing-provider revisions. Read it before
+ * the row goes, as the row is what names them.
+ */
+export async function listEnvelopeStorageKeys(
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<string[]> {
+  const [envelope] = await listEnvelopeArtifacts([envelopeId], database);
+
+  if (!envelope) {
+    return [];
+  }
+
+  const fieldImagesByEnvelopeId = await listFieldImagesForEnvelopeIds(
+    [envelope.id],
+    database,
+  );
+
+  return buildEnvelopeStorageKeys(
+    envelope,
+    fieldImagesByEnvelopeId.get(envelope.id) ?? [],
+  );
+}
+
+/** How many queued file deletions one cleanup tries, at most. */
+const PENDING_FILE_DELETIONS_PER_SWEEP = 500;
+
+/**
+ * Names files to delete once the transaction that deletes their envelope
+ * has committed. Until `deletePendingFile` removes one, the daily cleanup
+ * keeps trying it.
+ */
+export async function queueFileDeletions(
+  envelopeId: string,
+  keys: readonly string[],
+  now: number,
+  database: DbExecutor,
+): Promise<void> {
+  if (keys.length === 0) {
+    return;
+  }
+
+  await database.query(
+    `
+      INSERT INTO pending_file_deletions (storage_key, envelope_id, queued_at)
+      SELECT key, $2, $3 FROM unnest($1::text[]) AS key
+      ON CONFLICT (storage_key) DO NOTHING
+    `,
+    [keys, envelopeId, now],
+  );
+}
+
+/**
+ * Deletes one queued file and takes it off the queue. Returns false, after
+ * logging, when it could not, so it stays queued for the next cleanup.
+ */
+export async function deletePendingFile(
+  key: string,
+  database: DbExecutor,
+  storageService: StorageService,
+): Promise<boolean> {
+  try {
+    // Deleting a file that is already gone succeeds.
+    await storageService.deleteObject(key);
+    await database.query(
+      `DELETE FROM pending_file_deletions WHERE storage_key = $1`,
+      [key],
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      `Failed to delete stored file ${key}; it stays queued for the next cleanup:`,
+      error,
+    );
+    // To the back of the queue, so that files which keep failing do not
+    // stop the cleanup from reaching the others.
+    await database
+      .query(
+        `UPDATE pending_file_deletions SET last_tried_at = $2 WHERE storage_key = $1`,
+        [key, getCurrentUnixTimestamp()],
+      )
+      .catch((updateError: unknown) => {
+        console.error(
+          `Failed to note the failed deletion of stored file ${key}:`,
+          updateError,
+        );
+      });
+
+    return false;
+  }
+}
+
+/** Tries the queued file deletions, least recently tried first. */
+export async function deletePendingFiles(
+  database: DbExecutor,
+  storageService: StorageService,
+  limit = PENDING_FILE_DELETIONS_PER_SWEEP,
+): Promise<number> {
+  const pending = await queryMany<{ storageKey: string }>(
+    database,
+    `
+      SELECT storage_key AS "storageKey"
+      FROM pending_file_deletions
+      ORDER BY last_tried_at ASC NULLS FIRST, queued_at ASC, storage_key ASC
+      LIMIT $1
+    `,
+    [limit],
+  );
+  let done = 0;
+
+  for (const { storageKey } of pending) {
+    if (await deletePendingFile(storageKey, database, storageService)) {
+      done += 1;
+    }
+  }
+
+  return done;
+}
+
+/** Deletes these envelopes and their stored files. Returns how many went. */
+export async function deleteEnvelopesAndFiles(
+  envelopeIds: readonly string[],
+  database: DbExecutor = getDb(),
+  storageService: StorageService = createStorageService(),
+): Promise<number> {
+  if (envelopeIds.length === 0) {
+    return 0;
+  }
+
+  const envelopes = await listEnvelopeArtifacts(envelopeIds, database);
   const fieldImagesByEnvelopeId = await listFieldImagesForEnvelopeIds(
     envelopes.map((envelope) => envelope.id),
     database,
@@ -983,9 +1221,15 @@ export async function runRetentionSweep({
     finishedEnvelopeDeletionFailures: [],
     finishedEnvelopesDeleted: 0,
     finishedEnvelopeWarningsSent: 0,
+    pendingFileDeletionsDone: 0,
     providerSigningSessionsEnded: 0,
     ranAt: now,
   };
+
+  summary.pendingFileDeletionsDone = await deletePendingFiles(
+    database,
+    storageService,
+  );
 
   summary.expiredRecipientDownloadTokensDeleted =
     await deleteExpiredRecipientDownloadTokens(now, database);

@@ -13,6 +13,7 @@ import {
 } from "../db/connection.ts";
 import { logAuditRecord } from "../security/logging.ts";
 import { canonicalJson } from "../utils/canonical-json.ts";
+import { enqueueWebhookDeliveries } from "../webhooks/outbox.ts";
 
 export type AuditEventMetadata = Record<string, unknown> | null;
 
@@ -125,6 +126,9 @@ export async function listAuditEventsForEnvelope(
         created_at AS "createdAt"
       FROM audit_events
       WHERE envelope_id = $1
+      -- created_at is in whole seconds and id is random, so the chain's
+      -- sequence decides the order of events from the same second. Rows
+      -- from before the chain have none and come first.
       ORDER BY sequence ASC NULLS FIRST, created_at ASC, id ASC
     `,
     [envelopeId],
@@ -258,6 +262,18 @@ async function insertChainedAuditEvent(
   afterCommit(database, () => {
     logAuditRecord({ ...fields, rowHash, trail: "envelope" });
   });
+
+  // In the same transaction, so a webhook exists exactly when its event does.
+  await enqueueWebhookDeliveries(
+    {
+      auditEventId: id,
+      createdAt,
+      envelopeId: input.envelopeId,
+      event: input.event,
+      metadata: fields.metadata,
+    },
+    database,
+  );
 
   return auditEventRecordSchema.parse({
     actorEmail: fields.actorEmail,
